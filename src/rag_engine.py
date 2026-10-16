@@ -1,51 +1,94 @@
 import os
+import streamlit as st
 from langchain_community.document_loaders import DirectoryLoader, TextLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
+from langchain_community.vectorstores import Chroma
 
-CHROMA_PERSIST_DIR = "./chroma_db"
-KNOWLEDGE_BASE_DIR = "./data/knowledge_base"
+# Paths configuration
+KB_DIRECTORY = os.path.abspath(os.path.join(os.path.dirname(__file__), "../data/knowledge_base"))
+PERSIST_DIRECTORY = os.path.abspath(os.path.join(os.path.dirname(__file__), "../chroma_db"))
 
-def initialize_vector_store():
-    """Loads documents, splits into chunks, and saves embeddings to ChromaDB."""
-    if not os.path.exists(KNOWLEDGE_BASE_DIR):
-        os.makedirs(KNOWLEDGE_BASE_DIR, exist_ok=True)
+@st.cache_resource
+def get_embedding_model():
+    """Loads the model once and caches it in memory for instant subsequent queries."""
+    return HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu"}
+    )
 
-    # 1. Load documents
-    loader = DirectoryLoader(KNOWLEDGE_BASE_DIR, glob="**/*.md", loader_cls=TextLoader)
-    documents = loader.load()
+def ingest_knowledge_base():
+    """
+    Scans data/knowledge_base/ for markdown files, splits them into larger chunks (2000 chars),
+    embeds them, and saves them into ChromaDB.
+    """
+    print(f"[*] Scanning knowledge base directory: {KB_DIRECTORY}")
+    
+    if not os.path.exists(KB_DIRECTORY):
+        raise FileNotFoundError(f"Knowledge base directory not found at: {KB_DIRECTORY}")
 
-    if not documents:
-        print("[!] No documents found in data/knowledge_base. Add .md files first.")
-        return None
+    # 1. Load markdown files recursively
+    loader = DirectoryLoader(
+        KB_DIRECTORY,
+        glob="**/*.md",
+        loader_cls=TextLoader,
+        loader_kwargs={"encoding": "utf-8"}
+    )
+    raw_documents = loader.load()
+    print(f"[*] Loaded {len(raw_documents)} markdown files successfully.")
 
-    # 2. Chunking
+    # 2. Markdown Header Splitting (#, ##, ###)
+    headers_to_split_on = [
+        ("#", "Header 1"),
+        ("##", "Header 2"),
+        ("###", "Header 3"),
+    ]
+    markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
+    
+    header_split_docs = []
+    for doc in raw_documents:
+        splits = markdown_splitter.split_text(doc.page_content)
+        for split in splits:
+            split.metadata.update(doc.metadata)
+            header_split_docs.append(split)
+
+    # 3. Recursive Character Splitting with larger chunk size (2000 characters)
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=600,
-        chunk_overlap=100,
-        separators=["\n## ", "\n### ", "\n\n", "\n", " "]
+        chunk_size=2000,   # Larger chunk size for more detailed output text
+        chunk_overlap=300, # Smooth overlap for context continuity
+        separators=["\n\n", "\n", " ", ""]
     )
-    docs = text_splitter.split_documents(documents)
+    final_chunks = text_splitter.split_documents(header_split_docs)
+    print(f"[*] Generated {len(final_chunks)} semantic chunks ready for embedding.")
 
-    # 3. Embedding model using the updated package
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-
-    # 4. Vector store indexing using the updated package
-    vector_db = Chroma.from_documents(
-        documents=docs,
+    # 4. Embeddings & ChromaDB storage
+    embeddings = get_embedding_model()
+    
+    print(f"[*] Indexing chunks into ChromaDB at: {PERSIST_DIRECTORY}")
+    vector_store = Chroma.from_documents(
+        documents=final_chunks,
         embedding=embeddings,
-        persist_directory=CHROMA_PERSIST_DIR
+        persist_directory=PERSIST_DIRECTORY
     )
-    print(f"[+] Successfully indexed {len(docs)} chunks into ChromaDB at {CHROMA_PERSIST_DIR}")
-    return vector_db
+    
+    print("[+] RAG Knowledge Base re-indexed successfully with larger chunks!")
 
-def query_knowledge_base(query: str, k: int = 3):
-    """Retrieves top-k relevant security guidelines."""
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    vector_db = Chroma(persist_directory=CHROMA_PERSIST_DIR, embedding_function=embeddings)
-    results = vector_db.similarity_search(query, k=k)
+def query_knowledge_base(query_text: str, k: int = 5):
+    """
+    Queries the persistent ChromaDB vector store.
+    """
+    print(f"[*] Querying RAG knowledge base for: '{query_text}'")
+    
+    embeddings = get_embedding_model()
+    
+    vector_store = Chroma(
+        persist_directory=PERSIST_DIRECTORY,
+        embedding_function=embeddings
+    )
+    
+    results = vector_store.similarity_search(query_text, k=k)
     return results
 
+# Allows you to run ingestion directly from terminal if needed
 if __name__ == "__main__":
-    initialize_vector_store()
+    ingest_knowledge_base()

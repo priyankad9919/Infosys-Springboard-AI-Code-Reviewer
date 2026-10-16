@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 from src.validator import detect_and_validate
 from src.rag_engine import query_knowledge_base
@@ -43,8 +44,18 @@ with tab2:
         if user_query:
             results = query_knowledge_base(user_query, k=3)
             if results:
-                for idx, doc in enumerate(results, 1):
-                    with st.expander(f"Result {idx} (Source: {doc.metadata.get('source', 'Unknown')})"):
+                # --- ADDED: Deduplicate results to prevent overlapping chunks ---
+                seen_contents = set()
+                unique_results = []
+                for doc in results:
+                    if doc.page_content not in seen_contents:
+                        seen_contents.add(doc.page_content)
+                        unique_results.append(doc)
+                # -------------------------------------------------------------
+
+                for idx, doc in enumerate(unique_results, 1):
+                    source_name = doc.metadata.get('source', 'Unknown')
+                    with st.expander(f"Result {idx} (Source: {os.path.basename(source_name)})"):
                         st.write(doc.page_content)
             else:
                 st.info("No matching standards found. Ensure database is indexed.")
